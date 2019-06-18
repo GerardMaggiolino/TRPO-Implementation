@@ -5,28 +5,26 @@ import torch
 from copy import deepcopy
 from torch.nn.utils.convert_parameters import parameters_to_vector
 from torch.nn.utils.convert_parameters import vector_to_parameters
-from time import time
 
 
-class TRPOAgent:
-    """Continuous TRPO agent."""
+class LineSearchAgent:
+    """Continuous  agent."""
 
-    def __init__(self, policy, discount, kl_delta=0.01, cg_iteration=10,
-                 cg_dampening=0.001, cg_tolerance=1e-10):
+    def __init__(self, policy, discount, optim_lr=0.01, kl_delta=0.01):
         self.policy = policy
         self.discount = discount
         self.kl_delta = kl_delta
-        self.cg_iteration = cg_iteration
-        self.cg_dampening = cg_dampening
-        self.cg_tolerance = cg_tolerance
+        self.optim = torch.optim.Adam(policy.parameters(), lr=optim_lr)
 
         policy_modules = [module for module in policy.modules() if not
                           isinstance(module, torch.nn.Sequential)]
         self.action_dims = policy_modules[-1].out_features
         self.distribution = torch.distributions.normal.Normal
+
         self.logstd = torch.ones(self.action_dims, requires_grad=True)
         with torch.no_grad():
             self.logstd /= self.logstd.exp()
+        self.optim.add_param_group({'params': self.logstd})
 
         self.buffers = {'log_probs': [], 'actions': [], 'episode_reward': [],
                         'completed_rewards': [], 'states': []}
@@ -100,18 +98,19 @@ class TRPOAgent:
         ratio = new_prob.exp() / log_probs.detach().exp()
         return (ratio * advantages.view(-1, 1)).mean()
 
-    def line_search(self, gradients, states, actions, log_probs, rewards):
-        step_size = (2 * self.kl_delta / gradients.dot(
-            self.fisher_vector_direct(gradients, states))).sqrt()
+    def line_search(self, policy_gradients, std_gradients,
+                    states, actions, log_probs, rewards):
+        step_size = 1
         step_size_decay = 1.5
         line_search_attempts = 10
 
         # New policy
         current_parameters = parameters_to_vector(self.policy.parameters())
         new_policy = deepcopy(self.policy)
-        vector_to_parameters(current_parameters + step_size * gradients,
-                             new_policy.parameters())
-        new_std = self.logstd.detach() + step_size * self.logstd.grad
+        new_policy_parameters = (current_parameters +
+                                 step_size * policy_gradients)
+        vector_to_parameters(new_policy_parameters, new_policy.parameters())
+        new_std = self.logstd.detach() + step_size * std_gradients
 
         #  Shrink gradient until KL constraint met and improvement
         for attempt in range(line_search_attempts):
@@ -125,66 +124,20 @@ class TRPOAgent:
             # Shrink gradient if KL constraint not met or reward lower
             if kl_value > self.kl_delta or objective < 0:
                 step_size /= step_size_decay
-                vector_to_parameters(current_parameters + step_size *
-                                     gradients, new_policy.parameters())
-                new_std = self.logstd.detach() + step_size * self.logstd.grad
-            #  Return new policy and std if KL and reward met
+                new_policy_parameters = (current_parameters +
+                                         step_size * policy_gradients)
+                vector_to_parameters(new_policy_parameters,
+                                     new_policy.parameters())
+                new_std = self.logstd.detach() + step_size * std_gradients
+            # Transfer new policy and std if KL and reward met
             else:
-                return new_policy, new_std.requires_grad_()
-        else:
-            # Return old policy and std if constraints never met
-            return self.policy, self.logstd
+                vector_to_parameters(new_policy_parameters,
+                                     self.policy.parameters())
+                with torch.no_grad():
+                    self.logstd.data[:] = new_std
+                return
 
-
-    def fisher_vector_direct(self, vector, states):
-        """Computes the fisher vector product through direct method.
-
-        The FVP can be determined by first taking the gradient of KL
-        divergence w.r.t. the parameters and the dot product of this
-        with the input vector, then a gradient over this again w.r.t.
-        the parameters.
-        """
-        vector = vector.clone().requires_grad_()
-        # Gradient of KL w.r.t. network param
-        self.policy.zero_grad()
-        kl_divergence = self.kl(self.policy, self.logstd, states)
-        grad_kl = torch.autograd.grad(kl_divergence, self.policy.parameters(),
-                                      create_graph=True)
-        grad_kl = torch.cat([grad.view(-1) for grad in grad_kl])
-
-        # Gradient of the gradient vector dot product w.r.t. param
-        grad_vector_dot = grad_kl.dot(vector)
-        fisher_vector_product = torch.autograd.grad(grad_vector_dot,
-                                                    self.policy.parameters())
-        fisher_vector_product = torch.cat([out.view(-1) for out in
-                                           fisher_vector_product]).detach()
-
-        # Apply CG dampening and return fisher vector product
-        return fisher_vector_product + self.cg_dampening * vector.detach()
-
-    def conjugate_gradient(self, b, states):
-        """
-        Source:
-        https://github.com/ikostrikov/pytorch-trpo/blob/master/trpo.py
-
-        Slight modifications.
-        """
-        p = b.clone()
-        r = b.clone()
-        x = torch.zeros(*p.shape)
-        rdotr = r.double().dot(r.double())
-        for _ in range(self.cg_iteration):
-            z = self.fisher_vector_direct(p, states)
-            v = rdotr / p.double().dot(z.double())
-            x += v * p
-            r -= v * z
-            newrdotr = r.double().dot(r.double())
-            mu = newrdotr / rdotr
-            p = r + mu * p
-            rdotr = newrdotr
-            if rdotr < self.cg_tolerance:
-                break
-        return x
+        print('No step computed.')
 
     def optimize(self):
         # Return if no completed episodes
@@ -201,17 +154,30 @@ class TRPOAgent:
         # Normalize rewards over episodes
         rewards = (rewards - rewards.mean()) / rewards.std()
 
-        # Compute regular gradient
-        self.surrogate_objective(self.policy, self.logstd, states, actions,
-                                 log_probs, rewards).backward()
-        gradients = parameters_to_vector(
-            [param.grad for param in self.policy.parameters()])
+        # Save current parameters
+        self.optim.zero_grad()
+        old_policy_param = parameters_to_vector(
+            [param for param in self.policy.parameters()]).detach().clone()
+        old_std_param = self.logstd.detach().clone()
 
-        # Compute search direction as A^(-1)g
-        gradients = self.conjugate_gradient(gradients, states)
-        # Find new policy and std with line search
-        self.policy, self.logstd = self.line_search(gradients, states, actions,
-                                                    log_probs, rewards)
+        # Compute regular gradient and step
+        (-log_probs * rewards.view(-1, 1)).mean().backward()
+        self.optim.step()
+
+        # Find search direction by Adam
+        new_policy_param = parameters_to_vector(
+            [param for param in self.policy.parameters()]).detach()
+        policy_gradients = new_policy_param - old_policy_param
+        std_gradients = self.logstd.detach() - old_std_param
+
+        # Restore old policy
+        vector_to_parameters(old_policy_param, self.policy.parameters())
+        with torch.no_grad():
+            self.logstd[:] = old_std_param
+
+        # Find new policy and std with line search using Adam gradient
+        self.line_search(policy_gradients, std_gradients, states, actions,
+                         log_probs, rewards)
 
         # Update buffers removing processed steps
         for key, storage in self.buffers.items():

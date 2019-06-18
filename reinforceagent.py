@@ -16,9 +16,11 @@ class REINFORCEAgent:
                           isinstance(module, torch.nn.Sequential)]
         self.action_dims = policy_modules[-1].out_features
         self.distribution = torch.distributions.normal.Normal
+
         self.logstd = torch.ones(self.action_dims, requires_grad=True)
         with torch.no_grad():
             self.logstd /= self.logstd.exp()
+        self.optim.add_param_group({'params': self.logstd})
 
         self.buffers = {'log_probs': [],  'episode_reward': [],
                         'completed_rewards': []}
@@ -79,7 +81,7 @@ class REINFORCEAgent:
         advantages = (rewards - rewards.mean()) / rewards.std()
 
         # Optimize
-        self.policy.zero_grad()
+        self.optim.zero_grad()
         (-log_probs * advantages.view(-1, 1)).mean().backward()
         self.optim.step()
 

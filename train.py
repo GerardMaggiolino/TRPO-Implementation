@@ -3,6 +3,8 @@ import torch
 import matplotlib.pyplot as plt
 from trpoagent import TRPOAgent
 from reinforceagent import REINFORCEAgent
+from linesearchagent import LineSearchAgent
+from linesearchagent import get_globals
 
 
 def main():
@@ -13,12 +15,14 @@ def main():
     # Agent
     nn = torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.Tanh(),
                              torch.nn.Linear(32, 2))
-    init_weights = (lambda param : torch.nn.init.xavier_normal_(param.weight) if
+    init_weights = (lambda param: torch.nn.init.xavier_normal_(param.weight) if
                     isinstance(param, torch.nn.Linear) else None)
     nn.apply(init_weights)
     # Switch to train other agent
     # agent = TRPOAgent(policy=nn, discount=0.99, kl_delta=0.01)
-    agent = REINFORCEAgent(policy=nn, discount=0.99, optim_lr=0.01)
+    # agent = REINFORCEAgent(policy=nn, discount=0.99, optim_lr=0.01)
+    agent = LineSearchAgent(policy=nn, discount=0.99, optim_lr=0.01,
+                            kl_delta=0.01)
 
     # Training
     iterations = 50
@@ -55,10 +59,11 @@ def main():
         agent.optimize()
 
     plt.plot(reward_per_iteration)
-    plt.title('Standard TRPO reward on LunarLanderContinuous-v2')
+    plt.title(f'Standard LineSearchAgent reward on LunarLanderContinuous-v2')
     plt.ylabel('Reward')
     plt.xlabel('Iteration')
     plt.show()
+
 
 if __name__ == '__main__':
     main()
