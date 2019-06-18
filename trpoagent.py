@@ -2,21 +2,23 @@
 File holds self contained TRPO agent with simple interface.
 """
 import torch
-import gym
 from copy import deepcopy
 from torch.nn.utils.convert_parameters import parameters_to_vector
 from torch.nn.utils.convert_parameters import vector_to_parameters
 from time import time
 
-class TRPOAgent:
 
-    def __init__(self, policy, discount, delta=0.01, cg_iteration=10,
-                 cg_dampening=0.001):
+class TRPOAgent:
+    """Continuous TRPO agent."""
+
+    def __init__(self, policy, discount, kl_delta=0.01, cg_iteration=10,
+                 cg_dampening=0.001, cg_tolerance=1e-10):
         self.policy = policy
         self.discount = discount
-        self.delta = delta
+        self.kl_delta = kl_delta
         self.cg_iteration = cg_iteration
         self.cg_dampening = cg_dampening
+        self.cg_tolerance = cg_tolerance
 
         policy_modules = [module for module in policy.modules() if not
                           isinstance(module, torch.nn.Sequential)]
@@ -28,8 +30,6 @@ class TRPOAgent:
 
         self.buffers = {'log_probs': [], 'actions': [], 'episode_reward': [],
                         'completed_rewards': [], 'states': []}
-
-        self.recording = []
 
     def __call__(self, state):
         """
@@ -45,6 +45,7 @@ class TRPOAgent:
             Action choice for each action dimension.
         """
         state = torch.as_tensor(state, dtype=torch.float32)
+
         # Parameterize distribution with policy, sample action
         normal_dist = self.distribution(self.policy(state), self.logstd.exp())
         action = normal_dist.sample()
@@ -67,8 +68,6 @@ class TRPOAgent:
         self.buffers['episode_reward'].append(reward)
         # If episode is done
         if done:
-            # Recording of episode reward
-            self.recording.append(sum(self.buffers['episode_reward']))
             # Compute discounted reward
             episode_reward = self.buffers['episode_reward']
             for ind in range(len(episode_reward) - 2, -1, -1):
@@ -88,8 +87,8 @@ class TRPOAgent:
         """
         mu1 = self.policy(states)
         sigma1 = self.logstd.exp()
-        mu2 = new_policy(states)
-        sigma2 = new_std.exp()
+        mu2 = new_policy(states).detach()
+        sigma2 = new_std.exp().detach()
         kl_matrix = ((sigma2/sigma1).log() + 0.5 * (sigma1.pow(2) +
                      (mu1 - mu2).pow(2)) / sigma2.pow(2) - 0.5)
         return kl_matrix.sum(1).mean()
@@ -98,16 +97,16 @@ class TRPOAgent:
                             log_probs, advantages):
         new_dist = self.distribution(new_policy(states), new_std.exp())
         new_prob = new_dist.log_prob(actions)
-        ratio = new_prob.exp() / log_probs.exp()
+        ratio = new_prob.exp() / log_probs.detach().exp()
         return (ratio * advantages.view(-1, 1)).mean()
 
     def line_search(self, gradients, states, actions, log_probs, rewards):
-        step_size = (2 * self.delta / gradients.dot(
-                     self.fisher_vector_direct(states, gradients))).sqrt()
-        step_size_decay = 2
+        step_size = (2 * self.kl_delta / gradients.dot(
+            self.fisher_vector_direct(gradients, states))).sqrt()
+        step_size_decay = 1.5
         line_search_attempts = 10
-        print(step_size)
 
+        # New policy
         current_parameters = parameters_to_vector(self.policy.parameters())
         new_policy = deepcopy(self.policy)
         vector_to_parameters(current_parameters + step_size * gradients,
@@ -122,8 +121,9 @@ class TRPOAgent:
                 objective = self.surrogate_objective(new_policy, new_std,
                                                      states, actions, log_probs,
                                                      rewards)
+
             # Shrink gradient if KL constraint not met or reward lower
-            if kl_value > self.delta or objective < 0:
+            if kl_value > self.kl_delta or objective < 0:
                 step_size /= step_size_decay
                 vector_to_parameters(current_parameters + step_size *
                                      gradients, new_policy.parameters())
@@ -137,35 +137,53 @@ class TRPOAgent:
 
         return new_policy, new_std.requires_grad_()
 
-    def fisher_vector_direct(self, states, vector):
-        vector = vector.clone().requires_grad_()
-        # Compute gradient of KL w.r.t. network param
-        self.policy.zero_grad()
-        self.kl(self.policy, self.logstd, states).backward(retain_graph=True)
-        kl_gradient = parameters_to_vector([p.grad for p in
-                                            self.policy.parameters()])
-        # Compute gradient of gradient dot product w.r.t. network param
-        kl_gradient.dot(vector).backward()
-        output_vector = parameters_to_vector([p.grad for p in
-                                              self.policy.parameters()])
-        return output_vector + self.cg_dampening * vector.detach()
+    def fisher_vector_direct(self, vector, states):
+        """Computes the fisher vector product through direct method.
 
-    def conjugate_gradient(self, states, b):
+        The FVP can be determined by first taking the gradient of KL
+        divergence w.r.t. the parameters and the dot product of this
+        with the input vector, then a gradient over this again w.r.t.
+        the parameters.
+        """
+        vector = vector.clone().requires_grad_()
+        # Gradient of KL w.r.t. network param
+        self.policy.zero_grad()
+        kl_divergence = self.kl(self.policy, self.logstd, states)
+        grad_kl = torch.autograd.grad(kl_divergence, self.policy.parameters(),
+                                      create_graph=True)
+        grad_kl = torch.cat([grad.view(-1) for grad in grad_kl])
+
+        # Gradient of the gradient vector dot product w.r.t. param
+        grad_vector_dot = grad_kl.dot(vector)
+        fisher_vector_product = torch.autograd.grad(grad_vector_dot,
+                                                    self.policy.parameters())
+        fisher_vector_product = torch.cat([out.view(-1) for out in
+                                           fisher_vector_product]).detach()
+
+        # Apply CG dampening and return fisher vector product
+        return fisher_vector_product + self.cg_dampening * vector.detach()
+
+    def conjugate_gradient(self, b, states):
+        """
+        Source:
+        https://github.com/ikostrikov/pytorch-trpo/blob/master/trpo.py
+
+        Slight modifications.
+        """
         p = b.clone()
         r = b.clone()
         x = torch.zeros(*p.shape)
         rdotr = r.double().dot(r.double())
         for _ in range(self.cg_iteration):
-            z = self.fisher_vector_direct(states, p)
+            z = self.fisher_vector_direct(p, states)
             v = rdotr / p.double().dot(z.double())
-            x += v * p.cpu()
+            x += v * p
             r -= v * z
             newrdotr = r.double().dot(r.double())
             mu = newrdotr / rdotr
             p = r + mu * p
             rdotr = newrdotr
-            print('rdotr value: ', rdotr)
-            if rdotr < 1e-10:
+            if rdotr < self.cg_tolerance:
                 break
         return x
 
@@ -183,64 +201,20 @@ class TRPOAgent:
 
         # Normalize rewards over episodes
         rewards = (rewards - rewards.mean()) / rewards.std()
-        num_steps_in_batch = rewards.numel()
 
-        s = time()
-        # Find REINFORCE gradient
-        self.policy.zero_grad()
-        expected_reward = 0
-        for rew, prob in zip(rewards, log_probs):
-            expected_reward += prob * rew
-        expected_reward /= num_steps_in_batch
-        expected_reward.mean().backward()
-
+        # Compute regular gradient
+        self.surrogate_objective(self.policy, self.logstd, states, actions,
+                                 log_probs, rewards).backward()
         gradients = parameters_to_vector(
             [param.grad for param in self.policy.parameters()])
-        print('REINFORCE time: ', time() - s)
 
-        s = time()
-        # Line search with new gradients
-        gradients = self.conjugate_gradient(states, gradients)
+        # Compute search direction as A^(-1)g
+        gradients = self.conjugate_gradient(gradients, states)
+        # Find new policy and std with line search
         self.policy, self.logstd = self.line_search(gradients, states, actions,
                                                     log_probs, rewards)
-        print('CG time: ', time() - s)
-
-        # Print average reward over steps
-        print(sum(self.recording) / len(self.recording))
 
         # Update buffers removing processed steps
         for key, storage in self.buffers.items():
             if key != 'episode_reward':
-                del storage[:num_steps_in_batch]
-        self.recording = []
-
-
-def main():
-    env = gym.make('LunarLanderContinuous-v2')
-
-    nn = torch.nn.Sequential(torch.nn.Linear(8, 64), torch.nn.ReLU(),
-                             torch.nn.Linear(64, 2))
-    agent = TRPOAgent(nn, 0.99, 0.01)
-
-    iterations = 1500
-    steps = 4000
-
-    ob = env.reset()
-    t = 0
-    for _ in range(iterations):
-        for _ in range(steps):
-            t += 1
-            ob, rew, done, _ = env.step(agent(ob))
-            if t >= 800:
-                t = 0
-                agent.update(rew, True)
-                ob = env.reset()
-            else:
-                agent.update(rew, done)
-                if done:
-                    t = 0
-                    ob = env.reset()
-        agent.optimize()
-
-
-main()
+                del storage[:num_batch_steps]
