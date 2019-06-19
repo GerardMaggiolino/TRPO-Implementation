@@ -11,13 +11,19 @@ class REINFORCEAgent:
         self.policy = policy
         self.discount = discount
         self.optim = torch.optim.Adam(policy.parameters(), lr=optim_lr)
-
+        self.distribution = torch.distributions.normal.Normal
+        
+        # Cuda check
+        self.device = (torch.device('cuda') if torch.cuda.is_available()
+                       else torch.device('cpu'))
+        policy.to(self.device)
+        
+        # Set logstd
         policy_modules = [module for module in policy.modules() if not
                           isinstance(module, torch.nn.Sequential)]
-        self.action_dims = policy_modules[-1].out_features
-        self.distribution = torch.distributions.normal.Normal
-
-        self.logstd = torch.ones(self.action_dims, requires_grad=True)
+        action_dims = policy_modules[-1].out_features
+        self.logstd = torch.ones(action_dims, requires_grad=True,
+                                 device=self.device)
         with torch.no_grad():
             self.logstd /= self.logstd.exp()
         self.optim.add_param_group({'params': self.logstd})
@@ -38,7 +44,7 @@ class REINFORCEAgent:
         -------
             Action choice for each action dimension.
         """
-        state = torch.as_tensor(state, dtype=torch.float32)
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
         # Parameterize distribution with policy, sample action
         normal_dist = self.distribution(self.policy(state), self.logstd.exp())
@@ -76,7 +82,8 @@ class REINFORCEAgent:
         num_batch_steps = len(self.buffers['completed_rewards'])
         rewards = torch.tensor(self.buffers['completed_rewards'])
         log_probs = torch.stack(self.buffers['log_probs'][:num_batch_steps])
-
+        rewards, log_probs = rewards.to(self.device), log_probs.to(self.device)
+        
         # Normalize rewards over episodes
         advantages = (rewards - rewards.mean()) / rewards.std()
 

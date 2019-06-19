@@ -1,4 +1,5 @@
 import gym
+import gym_driving
 import torch
 import numpy.random
 import matplotlib.pyplot as plt
@@ -8,14 +9,18 @@ from linesearchagent import LineSearchAgent
 
 
 def main():
-    env = gym.make('LunarLanderContinuous-v2')
+    env = gym.make('Driving-v2')
     torch.manual_seed(1)
     env.seed(1)
     numpy.random.seed(1)
 
+    state_dim = len(env.observation_space.low)
+    action_dim = len(env.action_space.low)
+
     # Agent
-    nn = torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.Tanh(),
-                             torch.nn.Linear(32, 2))
+    nn = torch.nn.Sequential(torch.nn.Linear(state_dim, 64), torch.nn.Tanh(),
+                             torch.nn.Linear(64, 64), torch.nn.Tanh(), 
+                             torch.nn.Linear(64, action_dim))
     init_weights = (lambda param: torch.nn.init.xavier_normal_(param.weight) if
                     isinstance(param, torch.nn.Linear) else None)
     nn.apply(init_weights)
@@ -27,9 +32,9 @@ def main():
 
     # Training
     iterations = 100
-    steps_per_iter = 10000
+    steps_per_iter  = 16000
     episode_steps = 0
-    max_length_episode = 500
+    max_length_episode = 800
 
     # Recording
     episode_reward = []
@@ -41,7 +46,7 @@ def main():
         for step in range(steps_per_iter):
             # Take step with agent
             ob, rew, done, _ = env.step(agent(ob))
-            agent.update(rew, done)
+            agent.update_reward(rew)
 
             # Recording
             episode_reward.append(rew)
@@ -49,6 +54,7 @@ def main():
 
             # End of episode
             if done or episode_steps >= max_length_episode:
+                agent.update_done()
                 episode_steps = 0
                 reward_per_iteration[-1].append(sum(episode_reward))
                 episode_reward = []
@@ -69,10 +75,10 @@ def main():
                 ob = env.reset()
 
     plt.plot(reward_per_iteration)
-    plt.title(f'TRPO reward on LunarLanderContinuous-v2')
+    plt.title(f'TRPO reward on Driving-v2')
     plt.ylabel('Reward')
     plt.xlabel('Iteration')
-    #plt.show()
+    plt.save('trpo_reward.png')
 
 
 if __name__ == '__main__':

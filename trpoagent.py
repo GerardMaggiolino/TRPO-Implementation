@@ -21,11 +21,18 @@ class TRPOAgent:
         self.cg_tolerance = cg_tolerance
         self.cg_state_percent = cg_state_percent
 
+        # Cuda check
+        self.device = (torch.device('cuda') if torch.cuda.is_available()
+                       else torch.device('cpu'))
+        policy.to(self.device)
+
+        # Set logstd
         policy_modules = [module for module in policy.modules() if not
                           isinstance(module, torch.nn.Sequential)]
-        self.action_dims = policy_modules[-1].out_features
+        action_dims = policy_modules[-1].out_features
         self.distribution = torch.distributions.normal.Normal
-        self.logstd = torch.ones(self.action_dims, requires_grad=True)
+        self.logstd = torch.ones(action_dims, requires_grad=True,
+                                 device=self.device)
         with torch.no_grad():
             self.logstd /= self.logstd.exp()
 
@@ -45,7 +52,7 @@ class TRPOAgent:
         -------
             Action choice for each action dimension.
         """
-        state = torch.as_tensor(state, dtype=torch.float32)
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
         # Parameterize distribution with policy, sample action
         normal_dist = self.distribution(self.policy(state), self.logstd.exp())
@@ -54,27 +61,25 @@ class TRPOAgent:
         self.buffers['actions'].append(action)
         self.buffers['log_probs'].append(normal_dist.log_prob(action))
         self.buffers['states'].append(state)
-        return action.numpy()
+        return action.cpu().numpy()
 
-    def update(self, reward, done):
-        """Updates TRPOAgents reward buffer and done status.
+    def update_reward(self, reward):
+        """Updates TRPOAgent's reward buffer.
 
         Parameters
         ----------
         reward : float
             Reward for previous timestep.
-        done : bool
-            Done status for previous timestep.
         """
         self.buffers['episode_reward'].append(reward)
-        # If episode is done
-        if done:
-            # Compute discounted reward
-            episode_reward = self.buffers['episode_reward']
-            for ind in range(len(episode_reward) - 2, -1, -1):
-                episode_reward[ind] += self.discount * episode_reward[ind + 1]
-            self.buffers['completed_rewards'].extend(episode_reward)
-            self.buffers['episode_reward'] = []
+            
+    def update_done(): 
+         # Compute discounted reward
+        episode_reward = self.buffers['episode_reward']
+        for ind in range(len(episode_reward) - 2, -1, -1):
+            episode_reward[ind] += self.discount * episode_reward[ind + 1]
+        self.buffers['completed_rewards'].extend(episode_reward)
+        self.buffers['episode_reward'] = []
 
     def kl(self, new_policy, new_std, states, grad_new=True):
         """Compute KL divergence between current policy and new one.
@@ -188,7 +193,7 @@ class TRPOAgent:
         """
         p = b.clone()
         r = b.clone().double()
-        x = torch.zeros(*p.shape).double()
+        x = torch.zeros(*p.shape, device=self.device).double()
         rdotr = r.dot(r)
         for _ in range(self.cg_iteration):
             fvp = self.fisher_vector_direct(p, states).double()
@@ -207,13 +212,17 @@ class TRPOAgent:
         # Return if no completed episodes
         if len(self.buffers['completed_rewards']) == 0:
             return
-
+ 
         # Convert all buffers to tensors
         num_batch_steps = len(self.buffers['completed_rewards'])
         rewards = torch.tensor(self.buffers['completed_rewards'])
         actions = torch.stack(self.buffers['actions'][:num_batch_steps])
         states = torch.stack(self.buffers['states'][:num_batch_steps])
         log_probs = torch.stack(self.buffers['log_probs'][:num_batch_steps])
+        rewards, actions, states, log_probs = (rewards.to(self.device),
+                                               actions.to(self.device), 
+                                               states.to(self.device),
+                                               log_probs.to(self.device))
 
         # Normalize rewards over episodes
         rewards = (rewards - rewards.mean()) / rewards.std()

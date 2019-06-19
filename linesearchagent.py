@@ -15,13 +15,19 @@ class LineSearchAgent:
         self.discount = discount
         self.kl_delta = kl_delta
         self.optim = torch.optim.Adam(policy.parameters(), lr=optim_lr)
-
+        self.distribution = torch.distributions.normal.Normal
+        
+        # Cuda check
+        self.device = (torch.device('cuda') if torch.cuda.is_available()
+                       else torch.device('cpu'))
+        policy.to(self.device)
+        
+        # Set logstd
         policy_modules = [module for module in policy.modules() if not
                           isinstance(module, torch.nn.Sequential)]
-        self.action_dims = policy_modules[-1].out_features
-        self.distribution = torch.distributions.normal.Normal
-
-        self.logstd = torch.ones(self.action_dims, requires_grad=True)
+        action_dims = policy_modules[-1].out_features
+        self.logstd = torch.ones(action_dims, requires_grad=True,
+                                 device=self.device)
         with torch.no_grad():
             self.logstd /= self.logstd.exp()
         self.optim.add_param_group({'params': self.logstd})
@@ -42,7 +48,7 @@ class LineSearchAgent:
         -------
             Action choice for each action dimension.
         """
-        state = torch.as_tensor(state, dtype=torch.float32)
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
         # Parameterize distribution with policy, sample action
         normal_dist = self.distribution(self.policy(state), self.logstd.exp())
@@ -73,7 +79,7 @@ class LineSearchAgent:
             self.buffers['completed_rewards'].extend(episode_reward)
             self.buffers['episode_reward'] = []
 
-    def kl(self, new_policy, new_std, states):
+    def kl(self, new_policy, new_std, states, grad_new=True):
         """Compute KL divergence between current policy and new one.
 
         Parameters
@@ -82,13 +88,25 @@ class LineSearchAgent:
         new_std : torch.Tensor
         states : torch.Tensor
             States to compute KL divergence over.
+        grad_new : bool, optional
+            Enable gradient of new policy.
         """
         mu1 = self.policy(states)
-        sigma1 = self.logstd.exp()
-        mu2 = new_policy(states).detach()
-        sigma2 = new_std.exp().detach()
-        kl_matrix = ((sigma2/sigma1).log() + 0.5 * (sigma1.pow(2) +
-                     (mu1 - mu2).pow(2)) / sigma2.pow(2) - 0.5)
+        log_sigma1 = self.logstd
+        mu2 = new_policy(states)
+        log_sigma2 = new_std
+
+        # Detach other as gradient should only be w.r.t. to one
+        if grad_new:
+            mu1, log_sigma1 = mu1.detach(), log_sigma1.detach()
+        else:
+            mu2, log_sigma2 = mu2.detach(), log_sigma2.detach()
+
+        # Compute KL over all states
+        kl_matrix = ((log_sigma2 - log_sigma1) + 0.5 * (log_sigma1.exp().pow(2)
+                     + (mu1 - mu2).pow(2)) / log_sigma2.exp().pow(2) - 0.5)
+
+        # Sum over action dim, average over all states
         return kl_matrix.sum(1).mean()
 
     def surrogate_objective(self, new_policy, new_std, states, actions,
@@ -150,7 +168,11 @@ class LineSearchAgent:
         actions = torch.stack(self.buffers['actions'][:num_batch_steps])
         states = torch.stack(self.buffers['states'][:num_batch_steps])
         log_probs = torch.stack(self.buffers['log_probs'][:num_batch_steps])
-
+        rewards, actions, states, log_probs = (rewards.to(self.device), 
+                                               actions.to(self.device), 
+                                               states.to(self.device), 
+                                               log_probs.to(self.device))
+        
         # Normalize rewards over episodes
         rewards = (rewards - rewards.mean()) / rewards.std()
 
