@@ -5,20 +5,21 @@ import torch
 from copy import deepcopy
 from torch.nn.utils.convert_parameters import parameters_to_vector
 from torch.nn.utils.convert_parameters import vector_to_parameters
-from time import time
+from numpy.random import choice
 
 
 class TRPOAgent:
     """Continuous TRPO agent."""
 
     def __init__(self, policy, discount, kl_delta=0.01, cg_iteration=10,
-                 cg_dampening=0.001, cg_tolerance=1e-10):
+                 cg_dampening=0.001, cg_tolerance=1e-10, cg_state_percent=0.1):
         self.policy = policy
         self.discount = discount
         self.kl_delta = kl_delta
         self.cg_iteration = cg_iteration
         self.cg_dampening = cg_dampening
         self.cg_tolerance = cg_tolerance
+        self.cg_state_percent = cg_state_percent
 
         policy_modules = [module for module in policy.modules() if not
                           isinstance(module, torch.nn.Sequential)]
@@ -75,7 +76,7 @@ class TRPOAgent:
             self.buffers['completed_rewards'].extend(episode_reward)
             self.buffers['episode_reward'] = []
 
-    def kl(self, new_policy, new_std, states):
+    def kl(self, new_policy, new_std, states, grad_new=True):
         """Compute KL divergence between current policy and new one.
 
         Parameters
@@ -84,20 +85,35 @@ class TRPOAgent:
         new_std : torch.Tensor
         states : torch.Tensor
             States to compute KL divergence over.
+        grad_new : bool, optional
+            Enable gradient of new policy.
         """
         mu1 = self.policy(states)
-        sigma1 = self.logstd.exp()
-        mu2 = new_policy(states).detach()
-        sigma2 = new_std.exp().detach()
-        kl_matrix = ((sigma2/sigma1).log() + 0.5 * (sigma1.pow(2) +
-                     (mu1 - mu2).pow(2)) / sigma2.pow(2) - 0.5)
+        log_sigma1 = self.logstd
+        mu2 = new_policy(states)
+        log_sigma2 = new_std
+
+        # Detach other as gradient should only be w.r.t. to one
+        if grad_new:
+            mu1, log_sigma1 = mu1.detach(), log_sigma1.detach()
+        else:
+            mu2, log_sigma2 = mu2.detach(), log_sigma2.detach()
+
+        # Compute KL over all states
+        kl_matrix = ((log_sigma2 - log_sigma1) + 0.5 * (log_sigma1.exp().pow(2)
+                     + (mu1 - mu2).pow(2)) / log_sigma2.exp().pow(2) - 0.5)
+
+        # Sum over action dim, average over all states
         return kl_matrix.sum(1).mean()
 
     def surrogate_objective(self, new_policy, new_std, states, actions,
                             log_probs, advantages):
         new_dist = self.distribution(new_policy(states), new_std.exp())
         new_prob = new_dist.log_prob(actions)
+
+        # Detach old log_probs, only compute grad w.r.t. new policy
         ratio = new_prob.exp() / log_probs.detach().exp()
+
         return (ratio * advantages.view(-1, 1)).mean()
 
     def line_search(self, gradients, states, actions, log_probs, rewards):
@@ -131,10 +147,9 @@ class TRPOAgent:
             #  Return new policy and std if KL and reward met
             else:
                 return new_policy, new_std.requires_grad_()
-        else:
-            # Return old policy and std if constraints never met
-            return self.policy, self.logstd
 
+        # Return old policy and std if constraints never met
+        return self.policy, self.logstd
 
     def fisher_vector_direct(self, vector, states):
         """Computes the fisher vector product through direct method.
@@ -164,27 +179,29 @@ class TRPOAgent:
 
     def conjugate_gradient(self, b, states):
         """
+        Solve Ax = b for A as FIM and b as initial gradient.
+
         Source:
         https://github.com/ikostrikov/pytorch-trpo/blob/master/trpo.py
 
-        Slight modifications.
+        Slight modifications to original, all credit to original.
         """
         p = b.clone()
-        r = b.clone()
-        x = torch.zeros(*p.shape)
-        rdotr = r.double().dot(r.double())
+        r = b.clone().double()
+        x = torch.zeros(*p.shape).double()
+        rdotr = r.dot(r)
         for _ in range(self.cg_iteration):
-            z = self.fisher_vector_direct(p, states)
-            v = rdotr / p.double().dot(z.double())
-            x += v * p
-            r -= v * z
-            newrdotr = r.double().dot(r.double())
-            mu = newrdotr / rdotr
-            p = r + mu * p
-            rdotr = newrdotr
+            fvp = self.fisher_vector_direct(p, states).double()
+            v = rdotr / p.double().dot(fvp)
+            x += v * p.double()
+            r -= v * fvp
+            new_rdotr = r.dot(r)
+            mu = new_rdotr / rdotr
+            p = (r + mu * p.double()).float()
+            rdotr = new_rdotr
             if rdotr < self.cg_tolerance:
                 break
-        return x
+        return x.float()
 
     def optimize(self):
         # Return if no completed episodes
@@ -207,8 +224,12 @@ class TRPOAgent:
         gradients = parameters_to_vector(
             [param.grad for param in self.policy.parameters()])
 
+        # Choose states for conjugate gradient with np.random.choice
+        number_of_states = int(self.cg_state_percent * num_batch_steps)
+        cg_states = states[choice(len(states), number_of_states, replace=False)]
+
         # Compute search direction as A^(-1)g
-        gradients = self.conjugate_gradient(gradients, states)
+        gradients = self.conjugate_gradient(gradients, cg_states)
         # Find new policy and std with line search
         self.policy, self.logstd = self.line_search(gradients, states, actions,
                                                     log_probs, rewards)

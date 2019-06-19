@@ -1,16 +1,17 @@
 import gym
 import torch
+import numpy.random
 import matplotlib.pyplot as plt
 from trpoagent import TRPOAgent
 from reinforceagent import REINFORCEAgent
 from linesearchagent import LineSearchAgent
-from linesearchagent import get_globals
 
 
 def main():
     env = gym.make('LunarLanderContinuous-v2')
     torch.manual_seed(1)
     env.seed(1)
+    numpy.random.seed(1)
 
     # Agent
     nn = torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.Tanh(),
@@ -19,13 +20,13 @@ def main():
                     isinstance(param, torch.nn.Linear) else None)
     nn.apply(init_weights)
     # Switch to train other agent
-    # agent = TRPOAgent(policy=nn, discount=0.99, kl_delta=0.01)
+    agent = TRPOAgent(policy=nn, discount=0.99, kl_delta=0.01)
     # agent = REINFORCEAgent(policy=nn, discount=0.99, optim_lr=0.01)
-    agent = LineSearchAgent(policy=nn, discount=0.99, optim_lr=0.01,
-                            kl_delta=0.01)
+    # agent = LineSearchAgent(policy=nn, discount=0.99, optim_lr=0.01,
+    #                        kl_delta=0.01)
 
     # Training
-    iterations = 50
+    iterations = 100
     steps_per_iter = 10000
     episode_steps = 0
     max_length_episode = 500
@@ -58,11 +59,20 @@ def main():
         print(f'Iteration {iteration}: ', round(reward_per_iteration[-1], 3))
         agent.optimize()
 
+    ob = env.reset()
+    while True:
+        with torch.no_grad():
+            ob, rew, done, _ = env.step(agent(ob))
+            agent.update(rew, done)
+            env.render()
+            if done:
+                ob = env.reset()
+
     plt.plot(reward_per_iteration)
-    plt.title(f'Standard LineSearchAgent reward on LunarLanderContinuous-v2')
+    plt.title(f'TRPO reward on LunarLanderContinuous-v2')
     plt.ylabel('Reward')
     plt.xlabel('Iteration')
-    plt.show()
+    #plt.show()
 
 
 if __name__ == '__main__':
