@@ -1,5 +1,5 @@
 """
-File holds self contained TRPO agent with simple interface.
+File holds self contained REINFORCE agent using line search.
 """
 import torch
 from copy import deepcopy

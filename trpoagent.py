@@ -1,17 +1,18 @@
 """
-File holds self contained TRPO agent with simple interface.
+File holds self contained TRPO agent.
 """
 import torch
+import gym
+from numpy.random import choice
 from copy import deepcopy
 from torch.nn.utils.convert_parameters import parameters_to_vector
 from torch.nn.utils.convert_parameters import vector_to_parameters
-from numpy.random import choice
 
 
 class TRPOAgent:
     """Continuous TRPO agent."""
 
-    def __init__(self, policy, discount, kl_delta=0.01, cg_iteration=10,
+    def __init__(self, policy, discount=0.98, kl_delta=0.01, cg_iteration=10,
                  cg_dampening=0.001, cg_tolerance=1e-10, cg_state_percent=0.1):
         self.policy = policy
         self.discount = discount
@@ -36,7 +37,7 @@ class TRPOAgent:
         with torch.no_grad():
             self.logstd /= self.logstd.exp()
 
-        self.buffers = {'log_probs': [], 'actions': [], 'episode_reward': [],
+        self.buffers = {'log_probs': [], 'actions': [],
                         'completed_rewards': [], 'states': []}
 
     def __call__(self, state):
@@ -62,24 +63,6 @@ class TRPOAgent:
         self.buffers['log_probs'].append(normal_dist.log_prob(action))
         self.buffers['states'].append(state)
         return action.cpu().numpy()
-
-    def update_reward(self, reward):
-        """Updates TRPOAgent's reward buffer.
-
-        Parameters
-        ----------
-        reward : float
-            Reward for previous timestep.
-        """
-        self.buffers['episode_reward'].append(reward)
-            
-    def update_done(): 
-         # Compute discounted reward
-        episode_reward = self.buffers['episode_reward']
-        for ind in range(len(episode_reward) - 2, -1, -1):
-            episode_reward[ind] += self.discount * episode_reward[ind + 1]
-        self.buffers['completed_rewards'].extend(episode_reward)
-        self.buffers['episode_reward'] = []
 
     def kl(self, new_policy, new_std, states, grad_new=True):
         """Compute KL divergence between current policy and new one.
@@ -245,5 +228,66 @@ class TRPOAgent:
 
         # Update buffers removing processed steps
         for key, storage in self.buffers.items():
-            if key != 'episode_reward':
-                del storage[:num_batch_steps]
+            del storage[:num_batch_steps]
+
+    def train(self, env_name, seed=None, batch_size=12000, iterations=100,
+              max_episode_length=None, verbose=False):
+
+        # Initialize env
+        env = gym.make(env_name)
+        if seed is not None:
+            torch.manual_seed(seed)
+            env.seed(seed)
+        if max_episode_length is None:
+            max_episode_length = float('inf')
+        # Recording
+        recording = {'episode_reward': [[]],
+                     'episode_length': [0],
+                     'num_episodes_in_iteration': []}
+
+        # Begin training
+        observation = env.reset()
+        for iteration in range(iterations):
+            # Set initial value to 0
+            recording['num_episodes_in_iteration'].append(0)
+
+            for step in range(batch_size):
+                # Take step with agent
+                observation, reward, done, _ = env.step(self(observation))
+
+                # Recording, increment episode values
+                recording['episode_length'][-1] += 1
+                recording['episode_reward'][-1].append(reward)
+
+                # End of episode
+                if (done or
+                        recording['episode_length'][-1] >= max_episode_length):
+                    # Calculate discounted reward
+                    discounted_reward = recording['episode_reward'][-1].copy()
+                    for index in range(len(discounted_reward) - 2, -1, -1):
+                        discounted_reward[index] += self.discount * \
+                            discounted_reward[index + 1]
+                    self.buffers['completed_rewards'].extend(discounted_reward)
+
+                    # Set final recording of episode reward to total
+                    recording['episode_reward'][-1] = \
+                        sum(recording['episode_reward'][-1])
+                    # Recording
+                    recording['episode_length'].append(0)
+                    recording['episode_reward'].append([])
+                    recording['num_episodes_in_iteration'][-1] += 1
+
+                    # Reset environment
+                    observation = env.reset()
+
+            # Print information if verbose
+            if verbose:
+                num_episode = recording['num_episodes_in_iteration'][-1]
+                avg = (round(sum(recording['episode_reward'][-num_episode:-1])
+                       / num_episode, 3))
+                print(f'Average Reward over Iteration {iteration}: {avg}')
+            # Optimize after batch
+            self.optimize()
+
+        # Return recording information
+        return recording

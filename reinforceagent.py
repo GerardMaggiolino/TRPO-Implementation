@@ -1,5 +1,5 @@
 """
-File holds self contained REINFORCE agent with simple interface.
+File holds self contained REINFORCE agent.
 """
 import torch
 
