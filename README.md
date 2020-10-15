@@ -69,5 +69,6 @@ Constraining the REINFORCE update based on KL divergence of the realized
 policy from the network results in a lower score; it should be noted that the 
 implementation ONLY reduces the gradient based on KL divergence, and does not
 increase the gradient underneath the threshold. Thus, slower convergence in the 
-same number of iterations is expected. 
+same number of iterations is expected, assuming the parameter update has a net 
+positive influence on policy behavior. 
 
