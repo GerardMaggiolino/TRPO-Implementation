@@ -21,17 +21,19 @@ class TRPOAgent:
         self.cg_dampening = cg_dampening
         self.cg_tolerance = cg_tolerance
         self.cg_state_percent = cg_state_percent
+        self.distribution = torch.distributions.normal.Normal
 
         # Cuda check
         self.device = (torch.device('cuda') if torch.cuda.is_available()
                        else torch.device('cpu'))
         policy.to(self.device)
 
-        # Set logstd
+        # Infer action dimensions from policy
         policy_modules = [module for module in policy.modules() if not
                           isinstance(module, torch.nn.Sequential)]
         action_dims = policy_modules[-1].out_features
-        self.distribution = torch.distributions.normal.Normal
+
+        # Set logstd
         self.logstd = torch.ones(action_dims, requires_grad=True,
                                  device=self.device)
         with torch.no_grad():
@@ -220,7 +222,7 @@ class TRPOAgent:
         number_of_states = int(self.cg_state_percent * num_batch_steps)
         cg_states = states[choice(len(states), number_of_states, replace=False)]
 
-        # Compute search direction as A^(-1)g
+        # Compute search direction as A^(-1)g, A is FIM
         gradients = self.conjugate_gradient(gradients, cg_states)
         # Find new policy and std with line search
         self.policy, self.logstd = self.line_search(gradients, states, actions,
@@ -284,10 +286,21 @@ class TRPOAgent:
             if verbose:
                 num_episode = recording['num_episodes_in_iteration'][-1]
                 avg = (round(sum(recording['episode_reward'][-num_episode:-1])
-                       / num_episode, 3))
+                             / (num_episode - 1), 3))
                 print(f'Average Reward over Iteration {iteration}: {avg}')
             # Optimize after batch
             self.optimize()
 
         # Return recording information
         return recording
+
+    def save_model(self, path):
+        torch.save({
+            'policy': self.policy.state_dict(),
+            'logstd': self.logstd
+        }, path)
+
+    def load_model(self, path):
+        checkpoint = torch.load(path)
+        self.policy.load_state_dict(checkpoint['policy'])
+        self.logstd = checkpoint['logstd'].to(self.device)
